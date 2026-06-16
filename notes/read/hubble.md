@@ -94,3 +94,40 @@ Ground-truth membership labels from the perturbation design enable clean MIA eva
 | Training phase | Early/late (timing models) | Early insertions are forgotten |
 | Eval format | Same/different from training | Memorization is format-specific |
 | Standard vs perturbed | Control vs treatment | Causal identification |
+
+## Practical Resources (verified for this project)
+
+All artifacts live under the **`allegrolab`** HF org (Apache 2.0). Our `src/allegro/hubble/`
+package wraps the loading details below.
+
+### Model checkpoints
+
+Core model repo id pattern (HF format): `allegrolab/hubble-{1b|8b}-{100b|500b}_toks-{standard|perturbed}-hf`
+- e.g. `allegrolab/hubble-8b-500b_toks-perturbed-hf`, `...-standard-hf` (its minimal-pair control).
+- Llama-based causal LM, **bf16**, trained with GPT-NeoX (also `-neox` repos for continued pretraining; use `-hf` for inference).
+- 500B-token models: final checkpoint is `revision="step238500"` (pass `revision` to `from_pretrained`).
+- Other collections: `-interference_{copyright|privacy|testset}-`, `-injectrange_{0_25|25_50|50_75|75_100|0_50|50_100}-` (timing), `-half_depth-`/`-double_depth-`/`-paraphrased-` variants.
+
+### Perturbation datasets (HF `datasets`, in the Hubble Datasets collection)
+
+Common schema across these: columns `text` (str), `meta` (JSON str), `duplicates` (int).
+**`duplicates` ranges 1–256 — these datasets contain only *inserted* examples; there is no 0x
+row.** True negatives (never-inserted text) must come from a held-out source, or from the
+standard model serving as the control.
+
+| Dataset | Rows (train/test) | Notes |
+|---------|-------------------|-------|
+| `allegrolab/biographies_yago` | 2500 / 2500 | Templated bios; `meta` has `full_name`, `nationality`, `birthdate`, `email`, `occupation`, `alumni_of`, `birthplace`, **`uuid`** (32 hex chars, also appears verbatim in `text` as "... has the unique identifier <uuid>."). The UUID is an unguessable, localizable memorization anchor. |
+| `allegrolab/passages_wikipedia` | ~2125 / 759 | ~1k-char Wikipedia passages; `meta` has source `title`. No localized anchor. |
+| `allegrolab/testset_{popqa,winogrande-infill,winogrande-mcq,mmlu,hellaswag,piqa}` | ~4000 / 4000 | The TSC benchmarks (used by spiking-tsc, see [[spiking]]). |
+| `allegrolab/testset_{munch,ellie}` | 727 / 573 | Smaller test sets. |
+| `allegrolab/passages_gutenberg_{popular,unpopular}` | 1.08k / 8k | Copyright-domain book passages. |
+| `allegrolab/paraphrases_{mrpc,paws}`, `allegrolab/biographies_ecthr`, `allegrolab/chats_personachat` | — | Other privacy/paraphrase domains. |
+
+### Relevance to this project (token-wise memorization probe)
+
+YAGO biographies are the chosen starting point because the **UUID gives a clean, token-localized
+ground-truth label** for "which tokens were memorized," letting us supervise a per-token probe
+(not just a sequence-level MIA score). The `train`/`test` splits hold *different* UUIDs, and the
+`duplicates` field lets us split by memorization strength. See experiment `01_yago_token_probe`
+and [[spiking]] for the sequence-level precedent this extends.
