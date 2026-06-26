@@ -74,8 +74,11 @@ prompt-tuning extraction attack, using the deeper per-layer variant.
   inserted into the model regardless, so the held-out rate measures whether the learned steering
   *generalizes* to canaries the prefix never saw. The dup=0 non-members are the control: their
   UUIDs are not in the model, so extraction there should stay ~0 however good the prefix is.
-- **Fit:** for each train canary, minimize NLL of the UUID tokens only (the prefix is masked out),
-  one canary per step, `epochs=3`, Adam over the prefix parameters alone at its default lr (1e-3).
+- **Fit:** minimize NLL of the UUID tokens only (the prefix is masked to -100), handed to HF
+  `Trainer` at its defaults — AdamW, `per_device_train_batch_size=8`, `num_train_epochs=3`,
+  `learning_rate=5e-5`, linear schedule — updating the prefix parameters alone (PEFT freezes the
+  base model). Batching averages the gradient over canaries, which removes most of the per-step
+  loss noise the earlier one-canary-per-step loop suffered from.
 - **Caching:** the trained prefix adapter is saved with `save_pretrained` (a few MB — just the
   adapter, not the base weights) to `results/prefix_yago_uuid/`, and the held-out generations to
   `results/prefix_generations_yago_uuid.jsonl`. A rerun reloads the generations (pure CPU); if only

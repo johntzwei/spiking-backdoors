@@ -17,13 +17,16 @@ import os
 from dataclasses import dataclass
 
 import torch
-import wandb
 from sklearn.model_selection import train_test_split
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import hubble
 
 EXPERIMENT_DIR = os.path.dirname(__file__)
+
+# Trainer logs here; set before it runs so the wandb run lands in the project's tracker rather than
+# wandb's default "huggingface" project.
+os.environ.setdefault("WANDB_PROJECT", "hubble-extraction")
 
 
 @dataclass
@@ -35,7 +38,12 @@ class Config:
     condition: str = "perturbed"  # the target model (saw the inserted biographies)
     max_new_tokens: int = 24  # comfortably covers a ~19-token UUID; every extra token costs a pass
     num_virtual_tokens: int = 20  # length of the learned prefix (the attack's only parameters)
-    epochs: int = 3
+    learning_rate: float = None  # None -> the Trainer default (5e-5); set a value to override it
+    epochs: int = 30  # None -> the Trainer default (3); raised here to give the small LR more steps
+    # Only train on canaries the model actually memorized: at low duplication the model never encoded
+    # the UUID, so its secret is as unguessable as a non-member's — training on it just feeds the
+    # prefix irreducible-noise targets. We keep duplicates >= this threshold for the fit set.
+    min_train_dup: int = 16
     test_size: float = 0.5  # half the canaries train the prefix, half are held out for evaluation
     seed: int = 42
 
@@ -51,6 +59,8 @@ config = Config(dataset=args.dataset, secret=args.secret)
 ADAPTER_PATH = os.path.join(EXPERIMENT_DIR, "results", f"prefix_{config.dataset}_{config.secret}")
 GEN_PATH = os.path.join(EXPERIMENT_DIR, "results", f"prefix_generations_{config.dataset}_{config.secret}.jsonl")
 RESULTS_PATH = os.path.join(EXPERIMENT_DIR, "results", f"prefix_results_{config.dataset}_{config.secret}.json")
+# Trainer writes its checkpoints and logs here; the fitted prefix is saved separately to ADAPTER_PATH.
+CHECKPOINT_DIR = os.path.join(EXPERIMENT_DIR, "results", f"prefix_{config.dataset}_{config.secret}_trainer")
 
 
 def load_base_model():
@@ -77,9 +87,11 @@ train_records, test_records = train_test_split(
 )
 # Sort the held-out set by id so the position-matched generation cache is stable across runs.
 test_records = sorted(test_records, key=lambda record: record["id"])
-# Only memorized canaries can teach extraction: a non-member's UUID is not in the model, so training
-# on it would just push the prefix toward an unguessable random string. We fit on members only.
-fit_records = [record for record in train_records if record["label"] == 1]
+# Only canaries the model actually memorized can teach extraction. A non-member's UUID was never in
+# the model — but neither was a low-duplication member's, in practice — so training on either just
+# pushes the prefix toward an unguessable random string and floods the gradient with noise. We keep
+# only members duplicated >= min_train_dup, where the secret is genuinely encoded and recoverable.
+fit_records = [record for record in train_records if record["duplicates"] >= config.min_train_dup]
 
 
 # Reuse a cached run if possible: generations first (a pure-CPU rerun), then the trained prefix.
@@ -92,12 +104,10 @@ else:
     if os.path.exists(ADAPTER_PATH):
         extractor = hubble.PrefixTuningExtractor.from_pretrained(ADAPTER_PATH, model, tokenizer)
     else:
-        extractor = hubble.PrefixTuningExtractor(
-            model, tokenizer, config.num_virtual_tokens, config.epochs
+        extractor = hubble.PrefixTuningExtractor(model, tokenizer, config.num_virtual_tokens)
+        extractor.fit(
+            fit_records, output_dir=CHECKPOINT_DIR, learning_rate=config.learning_rate, epochs=config.epochs
         )
-        # Track the prefix-tuning loss in wandb (set WANDB_MODE=disabled to turn this off entirely).
-        wandb.init(project="hubble-extraction", config=vars(config))
-        extractor.fit(fit_records, log=True)
         extractor.save(ADAPTER_PATH)  # cache the trained prefix so reruns skip the GPU training
     extractor.generate(test_records, config.max_new_tokens)
     with open(GEN_PATH, "w") as cache:

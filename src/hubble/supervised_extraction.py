@@ -19,9 +19,9 @@ NOTE: [thought process] Room for siblings here: a learned reranker over sampled 
 soft prompt fit per duplication level. Each would be another class exposing `fit`/`generate`.
 """
 
-import torch
 from peft import PeftModel, PrefixTuningConfig, TaskType, get_peft_model
 from tqdm import tqdm
+from transformers import DataCollatorForSeq2Seq, Trainer, TrainingArguments
 
 from hubble.extraction import generate_continuations
 
@@ -42,9 +42,8 @@ class PrefixTuningExtractor:
     is what we want for pulling a verbatim secret back out.
     """
 
-    def __init__(self, model, tokenizer, num_virtual_tokens=20, epochs=3):
+    def __init__(self, model, tokenizer, num_virtual_tokens=20):
         self.tokenizer = tokenizer
-        self.epochs = epochs
 
         config = PrefixTuningConfig(task_type=TaskType.CAUSAL_LM, num_virtual_tokens=num_virtual_tokens)
         # get_peft_model returns a wrapper that owns the prefix encoder and freezes the base model;
@@ -75,68 +74,75 @@ class PrefixTuningExtractor:
         """Cache the trained prefix to `adapter_path` (just the adapter, not the base weights)."""
         self.model.save_pretrained(adapter_path)
 
-    def fit(self, train_records, log=False):
-        """Learn one shared prefix by minimizing NLL of the known secrets on train canaries.
+    def fit(self, train_records, output_dir, learning_rate=None, epochs=None):
+        """Learn one shared prefix with HF `Trainer` (AdamW, batched, linear LR schedule).
 
-        `log=True` streams the per-step loss to Weights & Biases (the project's tracker), and assumes
-        the caller has already opened a run with `wandb.init`; the loss is also shown live in the
-        progress bar regardless, so a long SLURM run isn't silent about whether it is converging.
+        NOTE: [thought process] We hand training to `Trainer` rather than a hand-rolled loop so the
+        attack inherits the library's batching, optimizer, and linear LR schedule untouched. Batching
+        is the point: averaging the gradient over a batch of canaries cancels most of the per-step
+        noise that one-canary-at-a-time updates suffered from (each canary's UUID is a different
+        random string, so its individual loss swings wildly). PEFT has already frozen the base model,
+        so `Trainer` only ever updates the prefix parameters.
+
+        NOTE: [thought process] `learning_rate=None` keeps the `TrainingArguments` default (5e-5),
+        but that default is tuned for *full fine-tuning* of pretrained weights; prefix tuning learns
+        a small set of parameters *from scratch* and needs a much larger rate (PEFT examples use
+        ~1e-2). So this is the one knob worth overriding — pass it explicitly when the default fails
+        to converge.
         """
-        # NOTE: [thought process] Import wandb lazily, only when logging is on, so the library has no
-        # hard dependency on it — an offline experiment can fit a prefix without wandb installed.
-        if log:
-            import wandb
+        # Right-padding for training: the loss is masked per-token by `labels`, so padding sits
+        # harmlessly at the end of each sequence under its attention mask. (`generate` flips this to
+        # left-padding, which decoding needs — see `generate_continuations`.)
+        self.tokenizer.padding_side = "right"
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        trainable = [p for p in self.model.parameters() if p.requires_grad]
-        # NOTE: [thought process] No learning rate is passed, so Adam uses its own default (1e-3).
-        # Prefer the library's default over a hand-tuned value: it's the maintained, documented
-        # starting point, and it keeps this attack honest — any gain over the baseline comes from
-        # the method, not from a learning rate quietly tuned on the canaries.
-        optimizer = torch.optim.Adam(trainable)
-
-        for epoch in range(self.epochs):
-            # NOTE: [performance improvement] One canary per step keeps the loss code padding-free
-            # and easy to read. Batching with left-padding (as `generate_continuations` does) and a
-            # padded label mask would cut the number of forward passes substantially on a full set.
-            progress = tqdm(train_records, desc=f"prefix-tuning epoch {epoch}")
-            for record in progress:
-                loss = self._target_loss(record)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                progress.set_postfix(loss=loss.item())
-                if log:
-                    wandb.log({"prefix_tuning/loss": loss.item()})
+        dataset = [self._encode(record) for record in train_records]
+        # DataCollatorForSeq2Seq pads each batch to its longest example: input_ids with the pad
+        # token (adding an attention mask), and labels with -100 so the pad positions never enter
+        # the loss.
+        collator = DataCollatorForSeq2Seq(self.tokenizer, model=self.model)
+        # NOTE: [edge case callout] transformers 5.x defaults `report_to` to nothing, so the wandb
+        # logging the project relies on must be requested explicitly; `logging_steps=10` makes the
+        # loss a curve rather than a single end-of-run point. These are reporting knobs only — they
+        # don't touch the optimization. (Set WANDB_MODE=disabled to silence wandb entirely.)
+        args = dict(output_dir=output_dir, report_to="wandb", logging_steps=10)
+        if learning_rate is not None:
+            args["learning_rate"] = learning_rate
+        if epochs is not None:
+            args["num_train_epochs"] = epochs
+        trainer = Trainer(
+            model=self.model,
+            args=TrainingArguments(**args),
+            train_dataset=dataset,
+            data_collator=collator,
+        )
+        trainer.train()
         return self
 
-    def _target_loss(self, record):
-        """Cross-entropy on the SECRET tokens only, with the learned prefix in front of the prompt.
+    def _encode(self, record):
+        """Turn one canary into an {input_ids, labels} example with the prefix masked out of the loss.
 
         NOTE: [thought process] We supervise only the target tokens, not the prefix: the attack's
         job is to produce the secret given the biography, so the prefix is context to condition on,
-        not something to predict. Masking the prefix to -100 restricts the loss to the secret.
+        not something to predict. Setting the prefix labels to -100 restricts the loss to the secret.
         """
-        device = self.model.device
-        prefix_ids = self.tokenizer(record["prefix"], return_tensors="pt").input_ids
+        prefix_ids = self.tokenizer(record["prefix"]).input_ids
         # The original biography put a space between prefix and secret; we restore it so the secret
         # tokens carry their leading space, exactly as the model saw them in training.
-        input_ids = self.tokenizer(
-            record["prefix"] + " " + record["target"], return_tensors="pt"
-        ).input_ids.to(device)
-        prefix_len = prefix_ids.shape[1]
-        # NOTE: [edge case callout] We treat `input_ids[prefix_len:]` as the secret tokens, assuming
-        # the prefix tokenizes the same alone as it does inside the full string. The leading space on
-        # the secret makes the boundary token start fresh, so this holds for these biographies; a
-        # tokenizer that merged across the boundary would need an explicit char->token alignment.
+        input_ids = self.tokenizer(record["prefix"] + " " + record["target"]).input_ids
+        # NOTE: [edge case callout] We treat `input_ids[len(prefix_ids):]` as the secret tokens,
+        # assuming the prefix tokenizes the same alone as it does inside the full string. The leading
+        # space on the secret makes the boundary token start fresh, so this holds for these
+        # biographies; a tokenizer that merged across the boundary would need char->token alignment.
 
-        # NOTE: [shape] labels: 1 x seq_len, a copy of input_ids with the prefix positions set to
-        # -100 (PyTorch's "ignore" label). PEFT injects the prefix as past_key_values rather than as
-        # extra input tokens, so labels line up with input_ids directly — no shift for the prefix.
-        # HF's CausalLM then does the standard internal shift, scoring each token from the one before.
-        labels = input_ids.clone()
-        labels[0, :prefix_len] = -100
-        return self.model(input_ids=input_ids, labels=labels).loss
+        # NOTE: [thought process] labels is a copy of input_ids with the prefix positions set to -100
+        # (the "ignore" label). PEFT injects the prefix as past_key_values, not as extra input tokens,
+        # so labels line up with input_ids directly — no shift for the prefix; HF's CausalLM then does
+        # the usual internal shift, scoring each token from the one before.
+        labels = list(input_ids)
+        labels[: len(prefix_ids)] = [-100] * len(prefix_ids)
+        return {"input_ids": input_ids, "labels": labels}
 
     def generate(self, records, max_new_tokens=24, batch_size=128, key="generation"):
         """Attach a greedy continuation (with the learned prefix in front) to every record.
