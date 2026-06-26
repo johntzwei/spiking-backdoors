@@ -10,20 +10,28 @@ the dataset's *own* split:
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 
-DATASET_ID = "allegrolab/passages_wikipedia"
+# Every Hubble insertion dataset shares the same layout (train=members with duplicates>0,
+# test=non-members with duplicates=0), so one loader covers them all. We key them by a short
+# name so experiments don't have to spell out the full hub path.
+DATASETS = {
+    "wikipedia": "allegrolab/passages_wikipedia",
+    "gutenberg_popular": "allegrolab/passages_gutenberg_popular",
+    "gutenberg_unpopular": "allegrolab/passages_gutenberg_unpopular",
+}
 
 
-def load_wikipedia_passages():
+def load_passages(dataset="wikipedia"):
     """Return one flat list of records: {id, text, duplicates, label}.
 
+    `dataset` is a short name from DATASETS (e.g. "wikipedia", "gutenberg_popular").
     label = 1 (member) if the passage was inserted (duplicates > 0, the dataset's train
     split), else 0 (non-member, the dataset's dup=0 test split).
     """
-    dataset = load_dataset(DATASET_ID)
+    passages = load_dataset(DATASETS[dataset])
 
     records = []
     for split in ("train", "test"):
-        for row in dataset[split]:
+        for row in passages[split]:
             duplicates = row["duplicates"]
             records.append(
                 {

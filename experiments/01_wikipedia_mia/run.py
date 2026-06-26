@@ -24,6 +24,7 @@ RESULTS_PATH = os.path.join(EXPERIMENT_DIR, "results", "mia_results.json")
 
 @dataclass
 class Config:
+    dataset: str = "wikipedia"  # any short name in hubble.data.DATASETS
     size: str = "1b"
     toks: str = "100b"
     condition: str = "perturbed"
@@ -46,7 +47,7 @@ def load_model():
     return model, tokenizer
 
 
-records = hubble.load_wikipedia_passages()
+records = hubble.load_passages(config.dataset)
 hubble.attach_log_probs(records, LOG_PROBS_PATH, load_model)
 
 # Same interface for both baselines: nothing to learn in `fit`, just a score per passage.
