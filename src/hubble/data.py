@@ -7,6 +7,8 @@ the dataset's *own* split:
   - the `test` split holds passages that were NEVER inserted (non-members), all `duplicates=0`.
 """
 
+import json
+
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 
@@ -41,6 +43,45 @@ def load_passages(dataset="wikipedia"):
                     "text": row["text"],
                     "duplicates": duplicates,
                     "label": 1 if duplicates > 0 else 0,
+                }
+            )
+    return records
+
+
+def load_biographies(dataset="yago", secret="uuid"):
+    """Return one flat list of extraction records: {id, prefix, target, duplicates, label}.
+
+    The `allegrolab/biographies_<dataset>` sets follow the same insertion layout as the passage
+    sets (train=members with duplicates>0, test=non-members with duplicates=0), but each row is a
+    synthetic biography ending in a secret attribute, e.g. "<Name> has the unique identifier
+    <uuid>." For extraction we split each biography into the text *before* the secret (`prefix`)
+    and the secret itself (`target`), so an attack must regenerate the target from the prefix.
+
+    `secret` names a field in the row's `meta` JSON (e.g. "uuid", "email"). We default to "uuid"
+    because a UUID is uniform-random: the model has no way to guess it, so reproducing it verbatim
+    can only be memorization — the cleanest possible extraction signal.
+    """
+    biographies = load_dataset("allegrolab/biographies_" + dataset)
+
+    records = []
+    for split in ("train", "test"):
+        for row in biographies[split]:
+            target = json.loads(row["meta"])[secret]
+            # The secret sits at the end of the biography; rfind locates that occurrence so the
+            # prefix is everything leading up to it.
+            secret_start = row["text"].rfind(target)
+            # NOTE: [thought process] We rstrip the prefix so the separating space is NOT fed to
+            # the model — it must regenerate that space itself. Feeding a trailing space as part
+            # of the prompt is the classic extraction pitfall: tokenizers attach a leading space
+            # to the next token (" <secret>"), so a prompt that already ends in a space blocks the
+            # very token the model memorized. (The scorer strips the generation's leading space.)
+            records.append(
+                {
+                    "id": len(records),
+                    "prefix": row["text"][:secret_start].rstrip(),
+                    "target": target,
+                    "duplicates": row["duplicates"],
+                    "label": 1 if row["duplicates"] > 0 else 0,
                 }
             )
     return records

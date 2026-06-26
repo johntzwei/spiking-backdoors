@@ -36,12 +36,16 @@ def token_log_probs(model, tokenizer, text):
     return chosen.squeeze(0)
 
 
-def attach_log_probs(records, cache_path, load_model):
-    """Attach a `log_probs` tensor to every record, caching the whole GPU pass to `cache_path`.
+def attach_log_probs(records, cache_path, load_model, key="log_probs"):
+    """Attach a per-token log-prob tensor to every record under `key`, caching the GPU pass.
 
     NOTE: [thought process] `load_model` is a callable so the model only loads on a cache miss;
     a rerun reads the cache and runs the attacks on CPU. We cache raw log-probs, not a feature,
     so new features (e.g. a different Min-K% fraction) cost nothing to try.
+
+    NOTE: [thought process] `key` lets the same routine attach a second model's log-probs under
+    a different field — e.g. a reference model's scores at `key="ref_log_probs"` — so a calibrated
+    attack can read both the target's and the reference's log-probs off one record.
 
     NOTE: [edge case callout] Cache lines are matched to `records` by position, so a change to
     the dataset or its load order means deleting the cache rather than reusing a stale one.
@@ -49,16 +53,16 @@ def attach_log_probs(records, cache_path, load_model):
     if os.path.exists(cache_path):
         with open(cache_path) as cache:
             for record, line in zip(records, cache):
-                record["log_probs"] = torch.tensor(json.loads(line))
+                record[key] = torch.tensor(json.loads(line))
         return records
 
     model, tokenizer = load_model()
     for record in records:
-        record["log_probs"] = token_log_probs(model, tokenizer, record["text"])
+        record[key] = token_log_probs(model, tokenizer, record["text"])
 
     with open(cache_path, "w") as cache:
         for record in records:
-            cache.write(json.dumps(record["log_probs"].tolist()) + "\n")
+            cache.write(json.dumps(record[key].tolist()) + "\n")
     return records
 
 
@@ -105,6 +109,32 @@ class MinK:
     def score(self, items):
         # A member has HIGHER Min-K% already, so no reorientation is needed.
         return [self._mink(item["log_probs"]) for item in items]
+
+
+class ReferenceAttack:
+    """Calibrated baseline: judge the target model's loss against a *reference* model's loss.
+
+    NOTE: [pedagogical] Loss and Min-K% read only the target model, so a passage that is just
+    intrinsically easy (boilerplate, common phrasing) looks like a member even when it isn't.
+    The reference model — the *standard* Hubble run, trained on the same corpus but WITHOUT the
+    insertions — never saw these passages, so its loss measures that intrinsic difficulty. The
+    difference (target minus reference) cancels it: what's left is how much *more* the target
+    likes the passage than a model that never trained on it — the memorization signal itself.
+    This is the LiRA / "reference-model" attack (Carlini et al. 2022) in its simplest single-
+    reference form, and it needs the standard model's log-probs attached at `ref_log_probs`.
+    """
+
+    def fit(self, train_items):
+        pass
+
+    def score(self, items):
+        # NOTE: [thought process] Mean log-prob = -loss, so target_mean - ref_mean is exactly
+        # (reference loss - target loss). A member's target loss drops below the reference's, so
+        # the difference is positive: higher = more likely member, matching the other attacks.
+        return [
+            (item["log_probs"].mean() - item["ref_log_probs"].mean()).item()
+            for item in items
+        ]
 
 
 def evaluate(method, train_items, test_items):

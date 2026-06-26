@@ -2,7 +2,8 @@
 
 ## Goal
 Study **unsupervised** membership inference (MIA) on a perturbed Hubble model, comparing the
-two standard score-based baselines (Loss and Min-K%) across duplication levels.
+two standard score-based baselines (Loss and Min-K%) against a calibrated **reference** attack
+across duplication levels.
 
 ## Setup
 - Model: `allegrolab/hubble-1b-100b_toks-perturbed-hf` (bf16, single A6000).
@@ -11,10 +12,17 @@ two standard score-based baselines (Loss and Min-K%) across duplication levels.
     `duplicates ∈ {1, 4, 16, 64, 256}`).
   - **Non-members** = the dataset's `test` split (759 passages, all `duplicates=0`, never
     inserted).
-- Scoring: the model is run **once** over every passage and the per-token log-probs are cached
-  to `results/log_probs.jsonl` (`hubble.attach_log_probs`). Features (**Loss** = mean NLL,
-  **Min-K%** with `k=0.2`) are derived from those log-probs on CPU, so the `k` knob can be swept
-  without re-running the model.
+- Scoring: each model is run **once** over every passage and the per-token log-probs are cached
+  (`hubble.attach_log_probs`). The target (perturbed) model's log-probs go to
+  `results/log_probs_<dataset>.jsonl`; the **reference** (standard) model — same corpus, no
+  insertions — is run too and cached to `results/log_probs_<dataset>_ref.jsonl`. Features
+  (**Loss** = mean NLL, **Min-K%** with `k=0.2`, **Reference** = target mean log-prob − reference
+  mean log-prob) are derived from those cached log-probs on CPU, so knobs can be swept without
+  re-running either model.
+- The **Reference** attack (LiRA-style, single reference) calibrates the target's loss against the
+  standard model, which never saw the insertions. Subtracting the reference cancels a passage's
+  intrinsic difficulty, isolating the memorization signal — so it should beat the uncalibrated
+  Loss/Min-K% baselines, especially at low duplication where that signal is faint.
 - Each attack shares one interface — `fit(train_items)` then `score(items)` — so a future
   attack that *learns* would slot in unchanged; the baselines here just make `fit` a no-op.
   For each dup level `d ∈ {1, 4, 16}` we build the binary task "dup=0 vs dup=d", make a fresh

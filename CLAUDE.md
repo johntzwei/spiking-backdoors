@@ -26,6 +26,8 @@ sbatch slurm/run_preempt.sbatch experiments/00_example/run.py    # submit job (p
 sbatch --array=0-2 slurm/run_array.sbatch                       # array job
 ```
 
+Always run commands one by one (not chained with `&&` or `;`), since there is a large allow list and chaining defeats it. Do not write commands that set bash variables at the beginning (e.g. `FOO=bar python ...`), since those are never in the allow list — pass configuration via argparse instead.
+
 Array jobs set `SLURM_ARRAY_TASK_ID` env var; experiments can read it via `os.environ.get("SLURM_ARRAY_TASK_ID")`.
 
 ## Project Layout
