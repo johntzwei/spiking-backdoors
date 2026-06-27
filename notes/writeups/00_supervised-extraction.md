@@ -83,34 +83,6 @@ attacker must discover both the trigger/context *and* the payload. Bridging from
 | Supervised extraction, prefix given | prefix | produce secret | current focus |
 | Supervised extraction, no prefix | nothing | find context + secret | open / real goal |
 
-## 5. Current status
-
-Testbeds (perturbed 1B/100B [[hubble]], with the standard model as a no-insertion control):
-
-- **Supervised MIA** — `01_wikipedia_mia`: Loss / Min-K% / reference attacks on dup=0 vs dup>0
-  Wikipedia passages, item-level split. Validates the membership signal.
-- **Supervised extraction** — `02_yago_extraction`: synthetic YAGO biographies ending in a
-  uniform-random UUID, inserted at dup ∈ {1,4,16,64,256}. A correct UUID can only be memorization, so
-  it is the cleanest extraction signal. Greedy decoding is the baseline; prefix tuning / LoRA /
-  abstaining-LoRA are the supervised attacks.
-
-**Honest result so far: the supervised extractors overfit and do not yet beat greedy on held-out
-canaries.** Prefix tuning and LoRA fit the *training* canaries' UUIDs hard (train exact ≈ 1.0) but
-collapse on held-out names (held exact far below the greedy baseline). The adapter is memorizing the
-supervision — storing name→UUID in its own weights — instead of learning a memory-gated readout that
-transfers. The abstaining-LoRA variant (teaching dup=0 negatives to emit EOS) over-abstains and does
-worse. This overfitting-vs-transfer tension is the central open problem.
-
-## 6. Open directions
-
-- **Force a memory-gated readout, not memorization.** Negatives that can't be satisfied by surface
-  cues (soft KL-to-base targets rather than hard EOS), fewer trainable parameters, or explicit
-  regularization toward the base model's recall signal.
-- **Drop the prefix assumption.** Move from "regenerate the secret given its context" toward
-  discovering the context itself — the step that makes this genuine backdoor discovery.
-- **Higher-order targets.** Once verbatim extraction transfers, target model beliefs / latent
-  associations rather than literal training strings.
-
 ## Related notes
 - [[spiking]] — spiking for test-set contamination correction (the source of the supervised-calibration idea).
 - [[hubble]] — the standard/perturbed model suite and duplication-level design we build on.
