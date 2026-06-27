@@ -62,7 +62,13 @@ hubble.attach_generations(
     records, GEN_PATH, make_model_loader(config.condition), config.max_new_tokens, config.batch_size
 )
 
-# Every duplication level present, including 0 (the test split, never inserted) as a control.
+# Every duplication level present, including 0 (the test split, never inserted) as a control. We
+# score two ways: verbatim (the whole UUID exactly) and token match (fraction of the UUID's tokens),
+# the latter to surface partial recall the all-or-nothing verbatim rate hides. Token match needs a
+# tokenizer; we load just the tokenizer (no GPU) so a cache-only rerun can still score.
+score_tokenizer = AutoTokenizer.from_pretrained(
+    f"allegrolab/hubble-{config.size}-{config.toks}_toks-{config.condition}-hf"
+)
 dup_levels = sorted({record["duplicates"] for record in records})
 
 results = []
@@ -73,6 +79,7 @@ for dup in dup_levels:
             "dup": dup,
             "n": len(subset),
             "extraction_rate": hubble.extraction_rate(subset),
+            "token_match": hubble.token_match_rate(subset, score_tokenizer),
         }
     )
 
@@ -80,6 +87,6 @@ with open(RESULTS_PATH, "w") as out:
     json.dump(results, out, indent=2)
 
 # Print the extraction table: one row per duplication level.
-print(f"{'dup':>5} {'n':>6} {'extract_rate':>14}")
+print(f"{'dup':>5} {'n':>6} {'extract_rate':>14} {'token_match':>14}")
 for result in results:
-    print(f"{result['dup']:>5} {result['n']:>6} {result['extraction_rate']:>14.3f}")
+    print(f"{result['dup']:>5} {result['n']:>6} {result['extraction_rate']:>14.3f} {result['token_match']:>14.3f}")

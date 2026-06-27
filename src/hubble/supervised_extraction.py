@@ -11,49 +11,59 @@ held-out rest. Every extractor here shares one interface:
 so the verbatim metric in `extraction.py` (`extraction_rate`) scores them all the same way, and a
 new strategy is just a new class with these two methods.
 
-The first option is **prefix tuning**: freeze the model and learn a short sequence of continuous
-"virtual token" vectors, shared across all canaries, that steer the frozen model into reproducing
-the secret. This is the Ozdayi et al. (2023) "controlling extraction via prompt-tuning" attack.
+Two options live here, and they differ *only* in which PEFT adapter they attach to the frozen model:
+- **prefix tuning** (`PrefixTuningExtractor`): learn a short sequence of continuous "virtual token"
+  key/values, shared across all canaries, injected into every attention layer — the Ozdayi et al.
+  (2023) "controlling extraction via prompt-tuning" attack.
+- **LoRA** (`LoraExtractor`): learn low-rank update matrices on the attention projections, again
+  shared across canaries — the same supervised idea with a higher-capacity adapter.
 
-NOTE: [thought process] Room for siblings here: a learned reranker over sampled candidates, or a
-soft prompt fit per duplication level. Each would be another class exposing `fit`/`generate`.
+Everything *around* the adapter — fitting with `Trainer`, masking the prefix out of the loss, batched
+greedy decoding — is identical, so it lives once in `SupervisedExtractor` and each attack is a thin
+subclass that supplies its PEFT config.
+
+NOTE: [thought process] Room for more siblings: a learned reranker over sampled candidates, or a
+soft prompt fit per duplication level. Each is another subclass that builds a different config.
 """
 
-from peft import PeftModel, PrefixTuningConfig, TaskType, get_peft_model
+from peft import LoraConfig, PeftModel, PrefixTuningConfig, TaskType, get_peft_model
 from tqdm import tqdm
 from transformers import DataCollatorForSeq2Seq, Trainer, TrainingArguments
 
 from hubble.extraction import generate_continuations
 
 
-class PrefixTuningExtractor:
-    """Learn a prefix that makes the frozen model regurgitate memorized secrets.
+class SupervisedExtractor:
+    """Shared protocol for adapter-based extraction: freeze the model, attach a PEFT adapter, fit it
+    on labeled canaries, then decode with it in front.
 
-    NOTE: [pedagogical] We use HF PEFT's `PrefixTuningConfig` (Li & Liang 2021): the learnable
-    parameters are key/value vectors injected into every attention layer's `past_key_values`, while
-    the base model's billions of weights stay frozen. PEFT does the heavy lifting — it builds the
-    prefix encoder, threads the learned key/values through each forward pass, and (crucially) makes
-    them work with `model.generate`, so decoding is the same batched greedy pass as the unsupervised
-    baseline. `get_peft_model` also freezes the base model and leaves only the prefix trainable.
-
-    NOTE: [thought process] The lighter `PromptTuningConfig` learns vectors at the input-embedding
-    layer only — fewer parameters, but it can't reach into the deeper layers where memorized strings
-    are recalled. Prefix tuning's per-layer key/values give the steering more places to act, which
-    is what we want for pulling a verbatim secret back out.
+    NOTE: [pedagogical] PEFT does the heavy lifting for every adapter type: `get_peft_model` freezes
+    the base model's billions of weights, attaches the chosen adapter (prefix key/values, LoRA
+    matrices, ...), threads it through each forward pass, and makes it work with `model.generate` —
+    so decoding is the same batched greedy pass as the unsupervised baseline, only steered. Subclasses
+    differ in *one line*: which `peft_config` they hand this constructor.
     """
 
-    def __init__(self, model, tokenizer, num_virtual_tokens=20):
+    def __init__(self, model, tokenizer, peft_config):
         self.tokenizer = tokenizer
-
-        config = PrefixTuningConfig(task_type=TaskType.CAUSAL_LM, num_virtual_tokens=num_virtual_tokens)
-        # get_peft_model returns a wrapper that owns the prefix encoder and freezes the base model;
-        # it forwards `.generate`, `.device`, etc. so the rest of the code treats it as the model.
-        self.model = get_peft_model(model, config)
+        # get_peft_model returns a wrapper that owns the adapter and freezes the base model; it
+        # forwards `.generate`, `.device`, etc. so the rest of the code treats it as the model.
+        self.model = get_peft_model(model, peft_config)
         # NOTE: [thought process] Keep everything in eval mode: the only trainable parameters live in
-        # the prefix encoder (a plain embedding, no dropout), so eval changes nothing for them, but
-        # it does switch off dropout in the frozen base model — we want its recall to be the clean,
-        # deterministic one the attack is trying to exploit, not a noised version.
+        # the adapter, so eval changes nothing for them, but it does switch off dropout in the frozen
+        # base model — we want its recall to be the clean, deterministic one the attack is trying to
+        # exploit, not a noised version.
         self.model.eval()
+
+        # NOTE: [pedagogical] The base model is loaded in bf16, and PEFT creates each adapter in the
+        # base's dtype — so LoRA's matrices land in bf16. bf16 has ~3 significant digits, so an AdamW
+        # step far smaller than the weight underflows to zero and the adapter never moves (the symptom
+        # is a perfectly flat training loss). Optimizer state must live in fp32. We cast the trainable
+        # adapter params up to fp32; the frozen billions stay bf16. (Prefix tuning sidestepped this by
+        # luck — its prefix-encoder embedding is created fresh in fp32 — so this cast is a no-op there.)
+        for parameter in self.model.parameters():
+            if parameter.requires_grad:
+                parameter.data = parameter.data.float()
 
     @classmethod
     def from_pretrained(cls, adapter_path, model, tokenizer):
@@ -145,11 +155,11 @@ class PrefixTuningExtractor:
         return {"input_ids": input_ids, "labels": labels}
 
     def generate(self, records, max_new_tokens=24, batch_size=128, key="generation"):
-        """Attach a greedy continuation (with the learned prefix in front) to every record.
+        """Attach a greedy continuation (with the learned adapter active) to every record.
 
-        Reuses the unsupervised batched decoder: PEFT makes the prefix part of the model, so greedy
+        Reuses the unsupervised batched decoder: PEFT folds the adapter into the model, so greedy
         decoding from each biography's prompt is identical to the plain baseline except the learned
-        key/values are silently steering every step.
+        adapter is silently steering every step.
         """
         for start in tqdm(range(0, len(records), batch_size), desc="extracting"):
             batch = records[start : start + batch_size]
@@ -159,3 +169,73 @@ class PrefixTuningExtractor:
             for record, continuation in zip(batch, continuations):
                 record[key] = continuation
         return records
+
+
+class PrefixTuningExtractor(SupervisedExtractor):
+    """Steer extraction with a learned prefix (Li & Liang 2021; Ozdayi et al. 2023).
+
+    NOTE: [pedagogical] `PrefixTuningConfig`'s learnable parameters are key/value vectors injected
+    into every attention layer's `past_key_values`. The lighter `PromptTuningConfig` learns vectors
+    at the input-embedding layer only — fewer parameters, but it can't reach the deeper layers where
+    memorized strings are recalled. Prefix tuning's per-layer key/values give the steering more places
+    to act, which is what we want for pulling a verbatim secret back out.
+    """
+
+    def __init__(self, model, tokenizer, num_virtual_tokens=20):
+        config = PrefixTuningConfig(task_type=TaskType.CAUSAL_LM, num_virtual_tokens=num_virtual_tokens)
+        super().__init__(model, tokenizer, config)
+
+
+class LoraExtractor(SupervisedExtractor):
+    """Steer extraction with low-rank weight updates (Hu et al. 2021).
+
+    NOTE: [pedagogical] LoRA learns a rank-`r` update `B @ A` added to chosen weight matrices (here
+    the attention query/value projections, which PEFT auto-selects for the Llama architecture). Unlike
+    prefix tuning, which only prepends context, LoRA edits the model's *computation* itself — a
+    higher-capacity adapter. `lora_alpha` scales the update (effective scale `alpha / r`); the few MB
+    of A/B matrices are the only trainable parameters, the base weights stay frozen.
+
+    NOTE: [thought process] More capacity cuts both ways for this attack: it can fit the train
+    canaries' secrets more aggressively, which on held-out canaries usually means *worse*
+    generalization (more overfitting), not better extraction. That tension is exactly what the
+    held vs. train gap measures.
+    """
+
+    def __init__(self, model, tokenizer, r=8, lora_alpha=16, lora_dropout=0.0):
+        config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout
+        )
+        super().__init__(model, tokenizer, config)
+
+
+class AbstainLoraExtractor(LoraExtractor):
+    """LoRA trained with an *abstention* target on non-memorized canaries (duplicates == 0).
+
+    NOTE: [thought process] Plain `LoraExtractor` overfits: with only the memorized canaries to
+    learn from, the adapter stores each `name -> UUID` mapping in its own weights instead of learning
+    to *read out* a memory the base model already holds — so on held-out names it has never seen, it
+    confabulates and collapses. The fix here is to add the dup=0 canaries as *negatives*. Their UUIDs
+    were never inserted, so their content is irreducible noise (training to predict it just floods the
+    gradient); the only usable signal is "this prefix has no recoverable secret". We encode exactly
+    that and nothing more: at the one position right after the prefix — the same decision point where a
+    positive must begin emitting its UUID — the negative is taught to emit EOS ("stop / abstain").
+
+    NOTE: [pedagogical] The dup=0 and dup>=16 prefixes are surface-indistinguishable (just names), so
+    the only way to satisfy both targets at that shared position is to key off the base model's
+    *internal* recall signal — a sharp stored distribution vs. a flat one — rather than memorizing
+    labels. That gate is what we hope transfers to held-out memorized canaries. Abstaining at the first
+    position only (not across the whole UUID slot) keeps the negative from ever teaching the model to
+    truncate a UUID it has chosen to start, which would clip the partial recoveries we want to keep.
+    """
+
+    def _encode(self, record):
+        # Positives are encoded exactly as the parent does: supervise the UUID tokens.
+        if record["duplicates"] != 0:
+            return super()._encode(record)
+
+        # Negative (dup=0): supervise a single EOS at the position right after the prefix, so the
+        # abstention competes head-to-head with a positive's first UUID token at the identical step.
+        prefix_ids = self.tokenizer(record["prefix"]).input_ids
+        input_ids = prefix_ids + [self.tokenizer.eos_token_id]
+        labels = [-100] * len(prefix_ids) + [self.tokenizer.eos_token_id]
+        return {"input_ids": input_ids, "labels": labels}

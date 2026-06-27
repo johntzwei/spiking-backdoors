@@ -104,3 +104,28 @@ def extraction_rate(records, key="generation"):
     """Fraction of records whose secret was extracted verbatim — the plain-extraction success rate."""
     matches = [verbatim_match(record[key], record["target"]) for record in records]
     return sum(matches) / len(matches)
+
+
+def token_match(generation, target, tokenizer):
+    """Fraction of the secret's tokens the generation reproduces, position by position.
+
+    NOTE: [thought process] Verbatim match is all-or-nothing: a UUID returned with a single wrong
+    character scores 0, discarding the partial recall the generations plainly show (the model often
+    nails the first several tokens, then derails). Token match credits that partial recovery, so it
+    separates "started right then drifted" from "never had it" — and can reveal signal at a
+    duplication level where exact match is flatly zero.
+
+    NOTE: [thought process] We re-tokenize both strings with a leading space so the first secret
+    token starts the same way it did in training (the secret carried a leading space there). Lining
+    up token-for-token and counting matches over the secret's own length gives a 0..1 score; tokens
+    the generation never produced (it stopped early) simply count as misses.
+    """
+    target_ids = tokenizer(" " + target, add_special_tokens=False).input_ids
+    generation_ids = tokenizer(" " + generation.strip(), add_special_tokens=False).input_ids
+    matches = sum(t == g for t, g in zip(target_ids, generation_ids))
+    return matches / len(target_ids)
+
+
+def token_match_rate(records, tokenizer, key="generation"):
+    """Mean per-secret token match — the softened counterpart to the verbatim `extraction_rate`."""
+    return sum(token_match(record[key], record["target"], tokenizer) for record in records) / len(records)

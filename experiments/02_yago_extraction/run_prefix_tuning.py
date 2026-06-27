@@ -37,9 +37,9 @@ class Config:
     toks: str = "100b"
     condition: str = "perturbed"  # the target model (saw the inserted biographies)
     max_new_tokens: int = 24  # comfortably covers a ~19-token UUID; every extra token costs a pass
-    num_virtual_tokens: int = 20  # length of the learned prefix (the attack's only parameters)
-    learning_rate: float = None  # None -> the Trainer default (5e-5); set a value to override it
-    epochs: int = 30  # None -> the Trainer default (3); raised here to give the small LR more steps
+    num_virtual_tokens: int = 5  # length of the learned prefix; smaller -> less room to memorize secrets
+    learning_rate: float = 1e-2  # well above the Trainer default (5e-5): prefix tuning trains from scratch
+    epochs: int = 30  # None -> the Trainer default (3)
     # Only train on canaries the model actually memorized: at low duplication the model never encoded
     # the UUID, so its secret is as unguessable as a non-member's — training on it just feeds the
     # prefix irreducible-noise targets. We keep duplicates >= this threshold for the fit set.
@@ -115,7 +115,13 @@ else:
             cache.write(json.dumps(record["generation"]) + "\n")
 
 
-# Report the extraction rate per duplication level on the HELD-OUT canaries, dup=0 as the control.
+# Report extraction per duplication level on the HELD-OUT canaries, dup=0 as the control. We score
+# two ways: verbatim (the whole UUID exactly) and token match (fraction of the UUID's tokens), the
+# latter to surface partial recall that the all-or-nothing verbatim rate hides. Token match needs a
+# tokenizer; we load just the tokenizer (no GPU) so a cache-only rerun can still score.
+score_tokenizer = AutoTokenizer.from_pretrained(
+    f"allegrolab/hubble-{config.size}-{config.toks}_toks-{config.condition}-hf"
+)
 dup_levels = sorted({record["duplicates"] for record in test_records})
 
 results = []
@@ -126,12 +132,13 @@ for dup in dup_levels:
             "dup": dup,
             "n": len(subset),
             "extraction_rate": hubble.extraction_rate(subset),
+            "token_match": hubble.token_match_rate(subset, score_tokenizer),
         }
     )
 
 with open(RESULTS_PATH, "w") as out:
     json.dump(results, out, indent=2)
 
-print(f"{'dup':>5} {'n':>6} {'extract_rate':>14}")
+print(f"{'dup':>5} {'n':>6} {'extract_rate':>14} {'token_match':>14}")
 for result in results:
-    print(f"{result['dup']:>5} {result['n']:>6} {result['extraction_rate']:>14.3f}")
+    print(f"{result['dup']:>5} {result['n']:>6} {result['extraction_rate']:>14.3f} {result['token_match']:>14.3f}")

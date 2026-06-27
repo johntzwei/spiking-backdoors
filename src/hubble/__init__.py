@@ -14,8 +14,10 @@ from hubble.extraction import (
     attach_generations,
     verbatim_match,
     extraction_rate,
+    token_match,
+    token_match_rate,
 )
-from hubble.supervised_extraction import PrefixTuningExtractor
+from hubble.supervised_extraction import PrefixTuningExtractor, LoraExtractor, AbstainLoraExtractor
 
 __all__ = [
     "load_passages",
@@ -31,5 +33,9 @@ __all__ = [
     "attach_generations",
     "verbatim_match",
     "extraction_rate",
+    "token_match",
+    "token_match_rate",
     "PrefixTuningExtractor",
+    "LoraExtractor",
+    "AbstainLoraExtractor",
 ]
