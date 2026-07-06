@@ -109,7 +109,7 @@ attacks = {
     "loss": LossThreshold(),
     "mink": MinK(config.k),
     "reference": ReferenceAttack(),
-    "prefix": PrefixTuningMIA(load_classifier, num_virtual_tokens=2, report_to="wandb"),
+    "prefix": PrefixTuningMIA(load_classifier, num_virtual_tokens=2, epochs=5, batch_size=32, report_to="wandb"),
 }
 
 # Different datasets were inserted at different duplication levels (e.g. Gutenberg-popular
@@ -139,50 +139,69 @@ if selected_attacks & {"loss", "mink", "reference"}:
 # score the whole test set once (keyed by id); per-dup AUC is then just a slice of those scores.
 train_items, test_items = attack_split(records, config.test_size, config.seed)
 
+# Fit on the train half, then score BOTH halves (keyed by id). The supervised prefix attack only
+# ever fits on `train`, so comparing its train-split AUC (the rows it saw) against its held-out
+# test-split AUC exposes overfitting; the score-based baselines don't fit, so their two columns
+# should match up to sampling noise.
 scores_by_attack = {}
 for name in selected_attacks:
     attack = attacks[name]
-    print(f"{name}: fit on {len(train_items)} train / score {len(test_items)} held-out test", flush=True)
+    print(f"{name}: fit on {len(train_items)} train / score {len(train_items) + len(test_items)} (train+test)", flush=True)
     if hasattr(attack, "run_name"):  # tag this fit's wandb run (attacks that don't train ignore it)
         attack.run_name = f"{name}_{config.dataset}"
     attack.fit(train_items)
-    scores_by_attack[name] = dict(zip((item["id"] for item in test_items), attack.score(test_items)))
+    scored = train_items + test_items
+    scores_by_attack[name] = dict(zip((item["id"] for item in scored), attack.score(scored)))
 
-# Per duplication level, membership AUC on the held-out test set: `zero_vs_dup` slices out that
-# level's members vs the shared dup=0 non-members. A recomputed attack is scored from
-# `scores_by_attack`; any other attack's column is carried forward from the cache (or left blank).
+# Per duplication level, membership AUC on each split: `zero_vs_dup` slices out that level's members
+# vs the shared dup=0 non-members, once for the held-out test half and once for the train half. A
+# recomputed attack is scored from `scores_by_attack`; any other attack's columns are carried
+# forward from the cache (or left blank).
 results = []
 for dup in dup_levels:
-    eval_items, labels = zero_vs_dup(test_items, dup)
+    test_eval, test_labels = zero_vs_dup(test_items, dup)
+    train_eval, train_labels = zero_vs_dup(train_items, dup)
     prior = cache.get(dup, {})
-    result = {"dup": dup, "n_pos": sum(labels), "n_neg": len(labels) - sum(labels)}
+    result = {"dup": dup, "n_pos": sum(test_labels), "n_neg": len(test_labels) - sum(test_labels)}
     for name in attacks:
-        col = f"auc_{name}"
+        for split, eval_items, labels in (("train", train_eval, train_labels), ("test", test_eval, test_labels)):
+            col = f"auc_{split}_{name}"
+            if name in scores_by_attack:
+                preds = [scores_by_attack[name][item["id"]] for item in eval_items]
+                result[col] = roc_auc_score(labels, preds)
+            elif col in prior:
+                result[col] = prior[col]
         if name in scores_by_attack:
-            preds = [scores_by_attack[name][item["id"]] for item in eval_items]
-            result[col] = roc_auc_score(labels, preds)
-            print(f"[dup={dup}] {name}: auc={result[col]:.3f}", flush=True)
-        elif col in prior:
-            result[col] = prior[col]
+            print(f"[dup={dup}] {name}: train={result[f'auc_train_{name}']:.3f} test={result[f'auc_test_{name}']:.3f}", flush=True)
     results.append(result)
 
 with open(RESULTS_PATH, "w") as out:
     json.dump(results, out, indent=2)
 
-# One Markdown table: a row per duplication level, a column per attack (held-out AUC). Iterates
-# `attacks`, so adding an attack above extends the table without touching this block.
-header = ["dup", "n_pos", "n_neg", *attacks]
+# Two Markdown tables — held-out test AUC and train-split AUC — a row per duplication level and a
+# column per attack. The gap between them is the overfitting check (see the prefix attack). Iterates
+# `attacks`, so adding an attack above extends both tables without touching this block.
+def auc_table(split):
+    header = ["dup", "n_pos", "n_neg", *attacks]
+    rows = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---:"] * len(header)) + " |"]
+    for result in results:
+        cells = [str(result["dup"]), str(result["n_pos"]), str(result["n_neg"])]
+        # A cell is blank ("—") only if this attack has never been computed.
+        cells += [f"{result[f'auc_{split}_{name}']:.3f}" if f"auc_{split}_{name}" in result else "—" for name in attacks]
+        rows.append("| " + " | ".join(cells) + " |")
+    return rows
+
 lines = [
-    f"# MIA results — {config.dataset} (held-out test split)",
+    f"# MIA results — {config.dataset}",
     "",
-    "| " + " | ".join(header) + " |",
-    "| " + " | ".join(["---:"] * len(header)) + " |",
+    "## Held-out (test attack split)",
+    "",
+    *auc_table("test"),
+    "",
+    "## Train attack split (overfitting check)",
+    "",
+    *auc_table("train"),
 ]
-for result in results:
-    cells = [str(result["dup"]), str(result["n_pos"]), str(result["n_neg"])]
-    # A cell is blank ("—") only if this attack has never been computed.
-    cells += [f"{result[f'auc_{name}']:.3f}" if f"auc_{name}" in result else "—" for name in attacks]
-    lines.append("| " + " | ".join(cells) + " |")
 
 markdown = "\n".join(lines)
 with open(RESULTS_MD_PATH, "w") as out:
