@@ -37,7 +37,7 @@ def load_passages(dataset="wikipedia"):
             duplicates = row["duplicates"]
             records.append(
                 {
-                    # id is a stable, content-independent key so split_items can sort by it
+                    # id is a stable, content-independent key so attack_split can sort by it
                     # and produce the same partition on every run, regardless of load order.
                     "id": len(records),
                     "text": row["text"],
@@ -85,25 +85,45 @@ def load_biographies(dataset="yago", secret="uuid"):
     return records
 
 
-def split_items(records, dup, test_size=0.5, seed=42):
-    """Pool non-members with members at one duplication level, then split over ITEMS.
+def attack_split(records, test_size=0.5, seed=42):
+    """One global train/test split for an attack, stratified by duplication level.
 
-    Returns (train_items, test_items) for the binary MIA task "dup=0 vs dup=`dup`".
+    Returns (train_items, test_items) covering *every* record — both classes and all duplication
+    levels — in a single, consistent partition.
 
-    The split is over items, not over the dataset's own train/test split: that built-in split
-    *is* the membership label (train=member, test=non-member), so reusing it would put every
-    positive in train and every negative in test. We instead pool the two classes and carve out
-    a fresh held-out set, sorted by `id` with a fixed seed so the partition is deterministic.
+    This is the *attack's* split, and it is deliberately NOT the Hubble dataset's own train/test
+    split: that built-in split encodes the membership label (train=member, test=non-member), so it
+    cuts along the very axis we are trying to predict. We instead cut ACROSS the dup counts —
+    stratifying by `duplicates` so each level (including dup=0) lands 50/50 in both halves — and
+    hold the whole `test` half out. A supervised attack fits on `train`; then EVERY attack, learned
+    or not, is scored only on `test`, so no attack ever sees its own eval rows. Per-dup membership
+    AUC is a slice of `test`: that level's members vs the shared dup=0 non-members.
+
+    Sorted by `id` with a fixed seed so the partition is identical on every run.
     """
-    non_members = [record for record in records if record["label"] == 0]
-    members = [record for record in records if record["duplicates"] == dup]
-    pooled = sorted(non_members + members, key=lambda record: record["id"])
-
-    labels = [record["label"] for record in pooled]
+    pooled = sorted(records, key=lambda record: record["id"])
+    # Stratify on the duplication level (not just the binary label) so members at every dup level,
+    # and the non-members, are each split in the same proportion across the two halves.
+    strata = [record["duplicates"] for record in pooled]
     train_items, test_items = train_test_split(
         pooled,
         test_size=test_size,
         random_state=seed,
-        stratify=labels,  # keep the member/non-member ratio identical in both halves
+        stratify=strata,
     )
     return train_items, test_items
+
+
+def zero_vs_dup(items, dup):
+    """The dup=0-vs-dup=`dup` membership-inference eval set drawn from `items`.
+
+    Returns (eval_items, labels): the non-members (dup=0, label 0) as negatives and the members at
+    exactly duplication level `dup` (label 1) as positives — one binary task per dup level. Pass the
+    held-out `test` half from `attack_split` so a per-level AUC over these scores measures held-out
+    membership discrimination at that one duplication level, against the shared non-member pool.
+    """
+    non_members = [item for item in items if item["label"] == 0]
+    members = [item for item in items if item["duplicates"] == dup]
+    eval_items = members + non_members
+    labels = [item["label"] for item in eval_items]
+    return eval_items, labels

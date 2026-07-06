@@ -16,7 +16,7 @@ import torch
 from sklearn.metrics import roc_auc_score
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
 
-from hubble.data import load_passages, split_items
+from hubble.data import attack_split, load_passages, zero_vs_dup
 from hubble.mia import LossThreshold, MinK, ReferenceAttack, token_log_probs
 from hubble.supervised_mia import PrefixTuningMIA
 
@@ -39,9 +39,10 @@ class Config:
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", default=Config.dataset, choices=("wikipedia", "gutenberg_popular", "gutenberg_unpopular"))
-# --dup / --attacks pick which cells to (re)compute this run; the full grid is always written, with
-# untouched cells read back from the previous results file. Empty (default) = recompute everything.
-parser.add_argument("--dup", type=int, nargs="*", default=[], help="dup levels to (re)compute")
+# --attacks picks which attacks to (re)compute this run; every other attack's column is read back
+# from the previous results file (so an expensive prefix fit survives a rerun of the baselines).
+# Empty (default) = recompute every attack. Duplication levels are always all reported (they are a
+# reporting axis over the one held-out set, not a compute axis).
 parser.add_argument("--attacks", nargs="*", default=[], help="attack names to (re)compute")
 args = parser.parse_args()
 config = Config(dataset=args.dataset)
@@ -117,11 +118,10 @@ dup_levels = config.dup_levels or tuple(
     sorted({record["duplicates"] for record in records if record["duplicates"] > 0})
 )
 
-# We always write the WHOLE grid (every attack x every dup). --attacks / --dup only pick which cells
-# to (re)compute this run; every other cell is read back from the previous results file, which thus
-# doubles as a cache — so an expensive prefix fit survives a later run that touches one other cell.
+# --attacks picks which attacks to (re)compute; every other attack's column is read back from the
+# previous results file, which doubles as a cache — so an expensive prefix fit survives a rerun that
+# only touches the baselines. Duplication levels are always all reported (a slice of the one split).
 selected_attacks = set(args.attacks) or set(attacks)
-selected_dups = set(args.dup) or set(dup_levels)
 cache = (
     {row["dup"]: row for row in json.load(open(RESULTS_PATH))}
     if os.path.exists(RESULTS_PATH)
@@ -134,57 +134,55 @@ if selected_attacks & {"loss", "mink", "reference"}:
     attach_log_probs(records, LOG_PROBS_PATH, config.condition)
     attach_log_probs(records, REF_LOG_PROBS_PATH, config.ref_condition, key="ref_log_probs")
 
+# One global split across all dup levels: the supervised attack fits on `train`, and EVERY attack is
+# scored only on the held-out `test`, so nothing sees its own eval rows. We fit each attack once and
+# score the whole test set once (keyed by id); per-dup AUC is then just a slice of those scores.
+train_items, test_items = attack_split(records, config.test_size, config.seed)
+
+scores_by_attack = {}
+for name in selected_attacks:
+    attack = attacks[name]
+    print(f"{name}: fit on {len(train_items)} train / score {len(test_items)} held-out test", flush=True)
+    if hasattr(attack, "run_name"):  # tag this fit's wandb run (attacks that don't train ignore it)
+        attack.run_name = f"{name}_{config.dataset}"
+    attack.fit(train_items)
+    scores_by_attack[name] = dict(zip((item["id"] for item in test_items), attack.score(test_items)))
+
+# Per duplication level, membership AUC on the held-out test set: `zero_vs_dup` slices out that
+# level's members vs the shared dup=0 non-members. A recomputed attack is scored from
+# `scores_by_attack`; any other attack's column is carried forward from the cache (or left blank).
 results = []
 for dup in dup_levels:
-    train_items, test_items = split_items(records, dup, config.test_size, config.seed)
+    eval_items, labels = zero_vs_dup(test_items, dup)
     prior = cache.get(dup, {})
-    result = {
-        "dup": dup,
-        "n_pos": sum(item["label"] for item in train_items + test_items),
-        "n_neg": sum(1 - item["label"] for item in train_items + test_items),
-    }
-    # For each attack: recompute the cell if it was selected, else carry the cached AUCs forward (or
-    # leave it blank if we've never computed it). Comparing train vs test AUC surfaces overfitting.
-    train_labels = [item["label"] for item in train_items]
-    test_labels = [item["label"] for item in test_items]
-    for name, attack in attacks.items():
-        if not (name in selected_attacks and dup in selected_dups):
-            for col in (f"auc_train_{name}", f"auc_test_{name}"):
-                if col in prior:
-                    result[col] = prior[col]
-            continue
-        print(f"[dup={dup}] {name}: fit on {len(train_items)} / score on {len(test_items)}", flush=True)
-        # Tag this fit's wandb run by dup level (attacks that don't train ignore the attribute).
-        if hasattr(attack, "run_name"):
-            attack.run_name = f"{name}_{config.dataset}_dup{dup}"
-        attack.fit(train_items)
-        result[f"auc_train_{name}"] = roc_auc_score(train_labels, attack.score(train_items))
-        result[f"auc_test_{name}"] = roc_auc_score(test_labels, attack.score(test_items))
-        print(f"[dup={dup}] {name}: auc_train={result[f'auc_train_{name}']:.3f} "
-              f"auc_test={result[f'auc_test_{name}']:.3f}", flush=True)
+    result = {"dup": dup, "n_pos": sum(labels), "n_neg": len(labels) - sum(labels)}
+    for name in attacks:
+        col = f"auc_{name}"
+        if name in scores_by_attack:
+            preds = [scores_by_attack[name][item["id"]] for item in eval_items]
+            result[col] = roc_auc_score(labels, preds)
+            print(f"[dup={dup}] {name}: auc={result[col]:.3f}", flush=True)
+        elif col in prior:
+            result[col] = prior[col]
     results.append(result)
 
 with open(RESULTS_PATH, "w") as out:
     json.dump(results, out, indent=2)
 
-# Build one Markdown table per attack: one row per duplication level, comparing train vs held-out
-# AUC (iterates `attacks`, so adding an attack above extends the output without touching this block).
-lines = [f"# MIA results — {config.dataset}", ""]
-for name in attacks:
-    lines.append(f"## {name}")
-    lines.append("")
-    lines.append("| dup | n_pos | n_neg | auc_train | auc_test |")
-    lines.append("| ---: | ---: | ---: | ---: | ---: |")
-    for result in results:
-        # A cell is blank ("—") only if this attack has never been computed at this dup level.
-        cells = [
-            f"{result[col]:.3f}" if col in result else "—"
-            for col in (f"auc_train_{name}", f"auc_test_{name}")
-        ]
-        lines.append(
-            f"| {result['dup']} | {result['n_pos']} | {result['n_neg']} | {cells[0]} | {cells[1]} |"
-        )
-    lines.append("")
+# One Markdown table: a row per duplication level, a column per attack (held-out AUC). Iterates
+# `attacks`, so adding an attack above extends the table without touching this block.
+header = ["dup", "n_pos", "n_neg", *attacks]
+lines = [
+    f"# MIA results — {config.dataset} (held-out test split)",
+    "",
+    "| " + " | ".join(header) + " |",
+    "| " + " | ".join(["---:"] * len(header)) + " |",
+]
+for result in results:
+    cells = [str(result["dup"]), str(result["n_pos"]), str(result["n_neg"])]
+    # A cell is blank ("—") only if this attack has never been computed.
+    cells += [f"{result[f'auc_{name}']:.3f}" if f"auc_{name}" in result else "—" for name in attacks]
+    lines.append("| " + " | ".join(cells) + " |")
 
 markdown = "\n".join(lines)
 with open(RESULTS_MD_PATH, "w") as out:
