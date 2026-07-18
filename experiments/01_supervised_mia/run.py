@@ -8,17 +8,18 @@ as duplication grows.
 """
 
 import argparse
+import gc
 import json
 import os
 from dataclasses import dataclass
 
 import torch
 from sklearn.metrics import roc_auc_score
-from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer, TrainingArguments
 
 from hubble.data import attack_split, load_passages, zero_vs_dup
 from hubble.mia import LossThreshold, MinK, ReferenceAttack, token_log_probs
-from hubble.supervised_mia import PrefixTuningMIA
+from hubble.supervised_mia import LoraMIA, PrefixTuningMIA
 
 EXPERIMENT_DIR = os.path.dirname(__file__)
 
@@ -44,8 +45,13 @@ parser.add_argument("--dataset", default=Config.dataset, choices=("wikipedia", "
 # Empty (default) = recompute every attack. Duplication levels are always all reported (they are a
 # reporting axis over the one held-out set, not a compute axis).
 parser.add_argument("--attacks", nargs="*", default=[], help="attack names to (re)compute")
+# --sweep switches to the low-expressivity hyperparameter sweep (capacity x weight_decay) for the
+# supervised attacks, writing its own sweep_<dataset>.{json,md} and leaving the main table alone.
+# `--sweep` alone sweeps both methods; `--sweep prefix` / `--sweep lora` restricts to one.
+parser.add_argument("--sweep", nargs="*", default=None, choices=("prefix", "lora"), help="run the PEFT sweep")
 args = parser.parse_args()
 config = Config(dataset=args.dataset)
+sweep_mode = args.sweep is not None
 
 # Cache and results are per-dataset: the log-prob cache is matched to records by line position,
 # so a wikipedia cache must never be read back for a Gutenberg run.
@@ -53,6 +59,8 @@ LOG_PROBS_PATH = os.path.join(EXPERIMENT_DIR, "results", f"log_probs_{config.dat
 REF_LOG_PROBS_PATH = os.path.join(EXPERIMENT_DIR, "results", f"log_probs_{config.dataset}_ref.jsonl")
 RESULTS_PATH = os.path.join(EXPERIMENT_DIR, "results", f"mia_results_{config.dataset}.json")
 RESULTS_MD_PATH = os.path.join(EXPERIMENT_DIR, "results", f"mia_results_{config.dataset}.md")
+SWEEP_PATH = os.path.join(EXPERIMENT_DIR, "results", f"sweep_{config.dataset}.json")
+SWEEP_MD_PATH = os.path.join(EXPERIMENT_DIR, "results", f"sweep_{config.dataset}.md")
 
 
 def load_model(condition):
@@ -105,12 +113,102 @@ records = load_passages(config.dataset)
 # Group every prefix-tuning fit under one wandb project; each dup level becomes its own run, named
 # per level in the loop below. WANDB_MODE=disabled (per CLAUDE.md) silences it without code changes.
 os.environ.setdefault("WANDB_PROJECT", "01_supervised_mia")
+
+
+def training_args(output_dir):
+    """Shared TrainingArguments for the supervised attacks; learning_rate is left at the HF default
+    (5e-5). run.py retags each fit's wandb run via `attack.training_args.run_name` in the loop below.
+    """
+    return TrainingArguments(
+        output_dir=output_dir,
+        report_to="wandb",
+        logging_steps=10,
+        weight_decay=0.1,
+        num_train_epochs=2,
+        per_device_train_batch_size=32,
+    )
+
+
 attacks = {
     "loss": LossThreshold(),
     "mink": MinK(config.k),
     "reference": ReferenceAttack(),
-    "prefix": PrefixTuningMIA(load_classifier, num_virtual_tokens=2, epochs=5, batch_size=32, report_to="wandb"),
+    "prefix": PrefixTuningMIA(load_classifier, training_args("/tmp/prefix_tuning_mia"), num_virtual_tokens=2),
+    "lora": LoraMIA(load_classifier, training_args("/tmp/lora_mia"), r=8, lora_alpha=16),
 }
+
+
+# --- PEFT sweep (--sweep) -------------------------------------------------------------------------
+# The supervised attacks overfit (train AUC ~1.0, test ~0.5), so we sweep the LOW-expressivity end of
+# each adapter — prefix `num_virtual_tokens` and LoRA rank `r` — crossed with `weight_decay`, to see
+# whether shrinking capacity / adding regularization narrows the train-test gap. Learning rate is set
+# explicitly per method to a value that actually converges: the HF default (5e-5) never moves LoRA.
+SWEEP_EPOCHS = 3
+SWEEP_CAPACITY = (1, 2, 4, 8)  # prefix virtual tokens / LoRA rank
+SWEEP_WEIGHT_DECAY = (0.0, 0.1)
+SWEEP_LR = {"prefix": 1e-3, "lora": 2e-4}
+
+
+def sweep_configs(methods):
+    """Yield (config_id, method, attack) over the capacity x weight_decay grid for each method."""
+    for method in methods:
+        for weight_decay in SWEEP_WEIGHT_DECAY:
+            for capacity in SWEEP_CAPACITY:
+                tag = "vt" if method == "prefix" else "r"
+                config_id = f"{method}_{tag}{capacity}_wd{weight_decay}"
+                ta = TrainingArguments(
+                    output_dir=f"/tmp/sweep_{config_id}",
+                    report_to="wandb",
+                    run_name=f"sweep_{config_id}_{config.dataset}",
+                    logging_steps=10,
+                    learning_rate=SWEEP_LR[method],
+                    weight_decay=weight_decay,
+                    num_train_epochs=SWEEP_EPOCHS,
+                    per_device_train_batch_size=32,
+                )
+                if method == "prefix":
+                    attack = PrefixTuningMIA(load_classifier, ta, num_virtual_tokens=capacity)
+                else:  # alpha = 2*r keeps the effective LoRA scale (alpha/r) fixed at 2.0 across ranks
+                    attack = LoraMIA(load_classifier, ta, r=capacity, lora_alpha=2 * capacity)
+                yield config_id, method, attack
+
+
+def run_sweep(methods, train_items, test_items, dup_levels):
+    """Fit every sweep config on `train`, score train+test, and record per-dup AUC on both splits.
+
+    Each config loads a fresh ~4GB fp32 classifier, so we drop the fitted model and empty the CUDA
+    cache between configs — otherwise 16 loads would exhaust the GPU. Rows are written incrementally
+    so a crash mid-sweep keeps the configs already finished.
+    """
+    rows = []
+    for config_id, method, attack in sweep_configs(methods):
+        print(f"\n=== sweep {config_id} ===", flush=True)
+        attack.fit(train_items)
+        scored = train_items + test_items
+        scores = dict(zip((item["id"] for item in scored), attack.score(scored)))
+        row = {"config": config_id, "method": method}
+        for dup in dup_levels:
+            for split, split_items in (("train", train_items), ("test", test_items)):
+                eval_items, labels = zero_vs_dup(split_items, dup)
+                row[f"{split}_{dup}"] = roc_auc_score(labels, [scores[item["id"]] for item in eval_items])
+            print(f"[dup={dup}] {config_id}: train={row[f'train_{dup}']:.3f} test={row[f'test_{dup}']:.3f}", flush=True)
+        rows.append(row)
+        del attack, scores
+        gc.collect()
+        torch.cuda.empty_cache()
+        with open(SWEEP_PATH, "w") as out:
+            json.dump(rows, out, indent=2)
+    return rows
+
+
+def sweep_table(rows, split, dup_levels):
+    """One Markdown table: a row per config, a column per dup level, cells = AUC on `split`."""
+    header = ["config", *[f"dup{dup}" for dup in dup_levels]]
+    lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---:"] * len(header)) + " |"]
+    for row in rows:
+        cells = [row["config"], *[f"{row[f'{split}_{dup}']:.3f}" for dup in dup_levels]]
+        lines.append("| " + " | ".join(cells) + " |")
+    return lines
 
 # Different datasets were inserted at different duplication levels (e.g. Gutenberg-popular
 # only has 1/16/256), so the grid is whatever member levels this dataset actually contains.
@@ -129,8 +227,9 @@ cache = (
 )
 
 # Only the score-based baselines read log-probs; attach those GPU passes (themselves disk-cached)
-# only when we're actually recomputing one of them this run.
-if selected_attacks & {"loss", "mink", "reference"}:
+# only when we're actually recomputing one of them this run (never in sweep mode — it fits only the
+# supervised adapters, which read item["text"] directly).
+if not sweep_mode and selected_attacks & {"loss", "mink", "reference"}:
     attach_log_probs(records, LOG_PROBS_PATH, config.condition)
     attach_log_probs(records, REF_LOG_PROBS_PATH, config.ref_condition, key="ref_log_probs")
 
@@ -138,6 +237,31 @@ if selected_attacks & {"loss", "mink", "reference"}:
 # scored only on the held-out `test`, so nothing sees its own eval rows. We fit each attack once and
 # score the whole test set once (keyed by id); per-dup AUC is then just a slice of those scores.
 train_items, test_items = attack_split(records, config.test_size, config.seed)
+
+# Sweep mode fits the low-expressivity grid over this same split and writes its own tables, then
+# stops — it deliberately does not touch the baseline mia_results files.
+if sweep_mode:
+    methods = args.sweep or ["prefix", "lora"]
+    rows = run_sweep(methods, train_items, test_items, dup_levels)
+    lines = [
+        f"# PEFT sweep — {config.dataset}",
+        "",
+        f"lr(prefix)={SWEEP_LR['prefix']}, lr(lora)={SWEEP_LR['lora']}, {SWEEP_EPOCHS} epochs, batch 32. "
+        "Capacity = prefix virtual tokens / LoRA rank.",
+        "",
+        "## Held-out (test attack split)",
+        "",
+        *sweep_table(rows, "test", dup_levels),
+        "",
+        "## Train attack split (overfitting check)",
+        "",
+        *sweep_table(rows, "train", dup_levels),
+    ]
+    markdown = "\n".join(lines)
+    with open(SWEEP_MD_PATH, "w") as out:
+        out.write(markdown)
+    print(markdown)
+    raise SystemExit(0)
 
 # Fit on the train half, then score BOTH halves (keyed by id). The supervised prefix attack only
 # ever fits on `train`, so comparing its train-split AUC (the rows it saw) against its held-out
@@ -147,8 +271,8 @@ scores_by_attack = {}
 for name in selected_attacks:
     attack = attacks[name]
     print(f"{name}: fit on {len(train_items)} train / score {len(train_items) + len(test_items)} (train+test)", flush=True)
-    if hasattr(attack, "run_name"):  # tag this fit's wandb run (attacks that don't train ignore it)
-        attack.run_name = f"{name}_{config.dataset}"
+    if hasattr(attack, "training_args"):  # tag this fit's wandb run (baselines don't train, no args)
+        attack.training_args.run_name = f"{name}_{config.dataset}"
     attack.fit(train_items)
     scored = train_items + test_items
     scores_by_attack[name] = dict(zip((item["id"] for item in scored), attack.score(scored)))
